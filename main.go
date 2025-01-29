@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	c "github.com/MelloB1989/karma/config"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/redis/go-redis/v9"
@@ -169,7 +170,8 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	proxy, err := NewProxyServer("localhost:6379")
+	karmaConfig := c.DefaultConfig()
+	proxy, err := NewProxyServer(karmaConfig.RedisURL)
 	if err != nil {
 		log.Fatalf("Failed to create proxy server: %v", err)
 	}
