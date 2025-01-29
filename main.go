@@ -194,7 +194,7 @@ func main() {
 		}
 	}()
 
-	port := ":8888"
+	port := ":6969"
 
 	server := &http.Server{
 		Addr:    port,
