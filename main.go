@@ -197,8 +197,9 @@ func (p *ProxyServer) getNextTarget(serviceName, cluster string) (*ServiceInfo, 
 
 func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Parse domain parts
-	parts := strings.Split(r.Host, ".")
-	if len(parts) < 6 {
+	log.Print(r.Host)
+	parts := strings.Split(r.Host, "-")
+	if len(parts) < 3 {
 		log.Printf("Invalid domain format. Got %d parts, expected at least 6", len(parts))
 		http.Error(w, "Invalid domain format", http.StatusBadRequest)
 		return
@@ -206,7 +207,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	serviceName := parts[0]
 	port := parts[1]
-	cluster := parts[2]
+	cluster := strings.Split(parts[2], ".")[0]
 
 	log.Printf("Parsed request - Service: %s, Port: %s, Cluster: %s", serviceName, port, cluster)
 
