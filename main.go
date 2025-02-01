@@ -14,6 +14,7 @@ import (
 
 	c "github.com/MelloB1989/karma/config"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/redis/go-redis/v9"
 )
@@ -21,6 +22,7 @@ import (
 type ProxyServer struct {
 	rdb           *redis.Client
 	ecsClient     *ecs.Client
+	ec2Client     *ec2.Client
 	loadBalancer  *sync.Map
 	cacheDuration time.Duration
 }
@@ -49,9 +51,27 @@ func NewProxyServer(redisAddr string) (*ProxyServer, error) {
 	return &ProxyServer{
 		rdb:           rdb,
 		ecsClient:     ecs.NewFromConfig(cfg),
+		ec2Client:     ec2.NewFromConfig(cfg),
 		loadBalancer:  &sync.Map{},
 		cacheDuration: 30 * time.Second,
 	}, nil
+}
+
+func (p *ProxyServer) getPublicIPFromENI(ctx context.Context, eniID string) (string, error) {
+	input := &ec2.DescribeNetworkInterfacesInput{
+		NetworkInterfaceIds: []string{eniID},
+	}
+
+	result, err := p.ec2Client.DescribeNetworkInterfaces(ctx, input)
+	if err != nil {
+		return "", fmt.Errorf("failed to describe network interface: %v", err)
+	}
+
+	if len(result.NetworkInterfaces) > 0 && result.NetworkInterfaces[0].Association != nil {
+		return *result.NetworkInterfaces[0].Association.PublicIp, nil
+	}
+
+	return "", fmt.Errorf("no public IP found for ENI")
 }
 
 func (p *ProxyServer) getServiceTasks(ctx context.Context, serviceName, cluster string) (*ServiceInfo, error) {
@@ -72,8 +92,11 @@ func (p *ProxyServer) getServiceTasks(ctx context.Context, serviceName, cluster 
 
 	tasks, err := p.ecsClient.ListTasks(ctx, input)
 	if err != nil {
+		log.Printf("ListTasks error: %v", err)
 		return nil, fmt.Errorf("failed to list tasks: %v", err)
 	}
+
+	log.Printf("Found %d tasks", len(tasks.TaskArns))
 
 	if len(tasks.TaskArns) == 0 {
 		return nil, fmt.Errorf("no tasks found for service %s in cluster %s", serviceName, cluster)
@@ -90,14 +113,54 @@ func (p *ProxyServer) getServiceTasks(ctx context.Context, serviceName, cluster 
 		return nil, fmt.Errorf("failed to describe tasks: %v", err)
 	}
 
-	// Extract private IPs
+	// Add this debugging code temporarily
+	for _, task := range taskDetails.Tasks {
+		taskJSON, _ := json.MarshalIndent(task, "", "    ")
+		log.Printf("Task details: %s", string(taskJSON))
+	}
+
+	// Extract public IPs from attachments
 	var taskIPs []string
 	for _, task := range taskDetails.Tasks {
-		for _, container := range task.Containers {
-			if container.NetworkInterfaces != nil && len(container.NetworkInterfaces) > 0 {
-				taskIPs = append(taskIPs, *container.NetworkInterfaces[0].PrivateIpv4Address)
+		if task.LastStatus != nil && *task.LastStatus == "RUNNING" {
+			// Get ENI ID from attachment
+			var eniID string
+			for _, attachment := range task.Attachments {
+				if *attachment.Type == "ElasticNetworkInterface" {
+					for _, detail := range attachment.Details {
+						if *detail.Name == "networkInterfaceId" {
+							eniID = *detail.Value
+							break
+						}
+					}
+				}
+			}
+
+			if eniID != "" {
+				// Get public IP using EC2 API
+				if publicIP, err := p.getPublicIPFromENI(ctx, eniID); err == nil {
+					taskIPs = append(taskIPs, publicIP)
+					log.Printf("Added public IP: %s for ENI: %s", publicIP, eniID)
+					continue
+				} else {
+					log.Printf("Failed to get public IP for ENI %s: %v", eniID, err)
+				}
+			}
+
+			// Fallback to private IP if no public IP found
+			for _, container := range task.Containers {
+				for _, ni := range container.NetworkInterfaces {
+					if ni.PrivateIpv4Address != nil {
+						taskIPs = append(taskIPs, *ni.PrivateIpv4Address)
+						log.Printf("Added private IP (fallback): %s for task: %s", *ni.PrivateIpv4Address, *task.TaskArn)
+					}
+				}
 			}
 		}
+	}
+
+	if len(taskIPs) == 0 {
+		return nil, fmt.Errorf("no IPs found for running tasks in service %s", serviceName)
 	}
 
 	serviceInfo := &ServiceInfo{
@@ -136,6 +199,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Parse domain parts
 	parts := strings.Split(r.Host, ".")
 	if len(parts) < 6 {
+		log.Printf("Invalid domain format. Got %d parts, expected at least 6", len(parts))
 		http.Error(w, "Invalid domain format", http.StatusBadRequest)
 		return
 	}
@@ -144,8 +208,11 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	port := parts[1]
 	cluster := parts[2]
 
+	log.Printf("Parsed request - Service: %s, Port: %s, Cluster: %s", serviceName, port, cluster)
+
 	// Get target using round-robin
 	serviceInfo, err := p.getNextTarget(serviceName, cluster)
+	log.Println(err)
 	if err != nil {
 		http.Error(w, "Service not available", http.StatusServiceUnavailable)
 		return
@@ -170,7 +237,12 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Printf("Starting proxy server...")
+
 	karmaConfig := c.DefaultConfig()
+	log.Printf("Redis URL: %s", karmaConfig.RedisURL)
+
 	proxy, err := NewProxyServer(karmaConfig.RedisURL)
 	if err != nil {
 		log.Fatalf("Failed to create proxy server: %v", err)
