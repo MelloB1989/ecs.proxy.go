@@ -1,0 +1,17 @@
+[Unit]
+Description=ECS Reverse Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Environment=AWS_ACCESS_KEY_ID=
+Environment=AWS_SECRET_ACCESS_KEY=
+Environment=AWS_REGION=
+Environment=REDIS_URL=
+WorkingDirectory=/opt/ecs-proxy
+ExecStart=/opt/ecs-proxy/proxy
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
